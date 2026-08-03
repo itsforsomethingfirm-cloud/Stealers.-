@@ -5,11 +5,26 @@ const fs = require('fs');
 const express = require('express');
 require('dotenv').config();
 
-// ----- Web server for health checks (Koyeb requires it) -----
+// ----- Web server for health checks -----
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is alive!'));
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
+
+// ----- Self‑ping to keep Render alive -----
+const RENDER_URL = process.env.RENDER_URL;
+if (RENDER_URL) {
+  console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
+  // Ping every 4 minutes
+  setInterval(() => {
+    axios.get(RENDER_URL).catch(() => {});
+  }, 4 * 60 * 1000);
+  
+  // Also ping when the bot starts
+  setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
+} else {
+  console.log('⚠️ RENDER_URL not set – self‑ping disabled.');
+}
 
 // ----- Discord Bot -----
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -67,7 +82,7 @@ client.on('interactionCreate', async interaction => {
         try {
             const form = new FormData();
             form.append('code', template);
-            form.append('level', 'max');  // VM + anti‑tamper
+            form.append('level', 'max');
 
             const response = await axios.post(OBFUSCATE_URL, form, {
                 headers: form.getHeaders(),
@@ -102,13 +117,18 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.editReply({ embeds: [embed] });
 
+        // 5. Ping self after successful command to keep alive
+        if (RENDER_URL) {
+            axios.get(RENDER_URL).catch(() => {});
+        }
+
     } catch (error) {
         console.error(error);
         await interaction.editReply({ content: '❌ Failed to generate script: ' + error.message });
     }
 });
 
-// ----- Pastebin Upload (free, requires API key) -----
+// ----- Pastebin Upload -----
 async function uploadToPastebin(content, username) {
     const apiKey = process.env.PASTEBIN_API_KEY;
     if (!apiKey) {
@@ -121,8 +141,8 @@ async function uploadToPastebin(content, username) {
         api_paste_code: content,
         api_paste_name: `Exodus_${username}_${Date.now()}.lua`,
         api_paste_format: 'lua',
-        api_paste_private: 1,          // unlisted
-        api_paste_expire_date: '1D'    // expires in 1 day
+        api_paste_private: 1,
+        api_paste_expire_date: '1D'
     });
 
     const response = await axios.post('https://pastebin.com/api/api_post.php', pasteData);
