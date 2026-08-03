@@ -76,17 +76,31 @@ client.on('interactionCreate', async interaction => {
         // Obfuscate
         const obfuscated = obfuscateScript(template);
 
-        // ----- Upload to Rentry.co (no API key needed, never expires) -----
-        const rentryRes = await axios.post('https://rentry.co/api/new', {
-            text: obfuscated
-        }, { timeout: 15000 });
+        // ----- Upload to Rentry.co with a custom URL slug -----
+        const slug = `exodus_${Date.now()}`; // unique slug
+        const rentryRes = await axios.post(
+            'https://rentry.co/api/new',
+            {
+                text: obfuscated,
+                url: slug  // include this to satisfy "required" field
+            },
+            {
+                timeout: 15000,
+                headers: { 'Content-Type': 'application/json' }
+            }
+        );
+
+        // Check for errors in response
+        if (rentryRes.data && rentryRes.data.status && rentryRes.data.status !== '200') {
+            const errorMsg = rentryRes.data.content || rentryRes.data.errors || 'Unknown error';
+            throw new Error(`Rentry error (${rentryRes.data.status}): ${errorMsg}`);
+        }
 
         if (!rentryRes.data || !rentryRes.data.url) {
             throw new Error('Rentry returned no URL. Response: ' + JSON.stringify(rentryRes.data));
         }
 
-        const slug = rentryRes.data.url.split('/').pop();
-        const rawUrl = `https://rentry.co/raw/${slug}`;
+        const rawUrl = `https://rentry.co/raw/${slug}`; // we can use the slug we set
         const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
 
         const embed = new EmbedBuilder()
