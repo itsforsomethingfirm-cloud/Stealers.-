@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
+const https = require('https');
+const http = require('http');
 
 // ==========================================
 // CONFIGURATION
@@ -13,19 +15,18 @@ const CONFIG = {
     CLIENT_ID: process.env.CLIENT_ID || "YOUR_CLIENT_ID_HERE",
     PORT: process.env.PORT || 3000,
     
-    // Replace with your Discord server's Role IDs
+    // SERVER URL FOR SELF-PINGING (KEEP-ALIVE)
+    SERVER_URL: process.env.SERVER_URL || "https://milkykey.onrender.com",
+    
+    // EXACT ROLE IDS
     ROLES: {
-        OWNER_ROLE_ID: {
+        "1530180565582483556": {
             name: "Owner",
             allowedDurations: ["1d", "7d", "30d", "lifetime"]
         },
-        ADMIN_ROLE_ID: {
-            name: "Admin",
-            allowedDurations: ["1d", "7d", "30d"]
-        },
-        RESELLER_ROLE_ID: {
-            name: "Reseller",
-            allowedDurations: ["1d", "7d"]
+        "1516742839516528681": {
+            name: "Developer",
+            allowedDurations: ["1d", "7d", "30d", "lifetime"]
         }
     }
 };
@@ -113,6 +114,18 @@ app.get('/', (req, res) => {
 
 app.listen(CONFIG.PORT, () => {
     console.log(`[API] Server online on port ${CONFIG.PORT}`);
+    
+    // ==========================================
+    // AUTOMATIC SELF-PING SYSTEM (EVERY 1 MINUTE)
+    // ==========================================
+    setInterval(() => {
+        const protocol = CONFIG.SERVER_URL.startsWith('https') ? https : http;
+        protocol.get(CONFIG.SERVER_URL, (res) => {
+            console.log(`[KEEP-ALIVE] Pinged ${CONFIG.SERVER_URL} - Status: ${res.statusCode}`);
+        }).on('error', (err) => {
+            console.error(`[KEEP-ALIVE] Ping failed:`, err.message);
+        });
+    }, 60 * 1000); // 60,000 ms = 1 minute
 });
 
 // ==========================================
@@ -167,7 +180,7 @@ client.on('interactionCreate', async interaction => {
 
     const { commandName, member } = interaction;
 
-    // Check Role Permissions
+    // Check Role Permissions against Role IDs
     let userPermissions = null;
     for (const [roleId, perm] of Object.entries(CONFIG.ROLES)) {
         if (member.roles.cache.has(roleId)) {
