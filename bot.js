@@ -6,7 +6,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// ----- Web server (for health check & self‑host fallback) -----
+// ----- Web server (health check & self‑host fallback) -----
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is alive!'));
@@ -44,7 +44,6 @@ app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL;
 if (BASE_URL) {
     console.log(`🌐 Public base URL: ${BASE_URL}`);
-    // Self‑ping
     setInterval(() => axios.get(BASE_URL).catch(() => {}), 4 * 60 * 1000);
     setTimeout(() => axios.get(BASE_URL).catch(() => {}), 5000);
 } else {
@@ -106,7 +105,7 @@ client.on('interactionCreate', async interaction => {
         // Obfuscate
         const obfuscated = obfuscateScript(template);
 
-        // Try to upload – returns { rawUrl, service }
+        // Upload – returns { rawUrl, service }
         const result = await uploadScript(obfuscated);
         if (!result) {
             return interaction.editReply({ 
@@ -115,16 +114,31 @@ client.on('interactionCreate', async interaction => {
         }
 
         const { rawUrl, service } = result;
-        const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
+        // Clean the URL (remove any accidental whitespace)
+        const cleanUrl = rawUrl.trim();
+        // Build the loadstring – exactly one line, no extra parentheses
+        const loadstringLine = `loadstring(game:HttpGet("${cleanUrl}"))()`;
 
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('✅ Script Generated')
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
-                { name: '📜 Loadstring', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
-                { name: '📦 Hosted on', value: service, inline: false },
-                { name: '🔒 Obfuscation', value: 'XOR + Base64', inline: false }
+                { 
+                    name: '📜 Loadstring (copy this)', 
+                    value: `\`\`\`lua\n${loadstringLine}\n\`\`\``,
+                    inline: false 
+                },
+                { 
+                    name: '📦 Hosted on', 
+                    value: service, 
+                    inline: false 
+                },
+                { 
+                    name: '🔒 Obfuscation', 
+                    value: 'XOR + Base64', 
+                    inline: false 
+                }
             )
             .setTimestamp();
 
@@ -179,11 +193,10 @@ async function uploadScript(content) {
 
 // ----- Service uploaders -----
 async function uploadPastefy(content) {
-    // Pastefy API v2 – no API key needed for public pastes
     const res = await axios.post('https://pastefy.app/api/v2/paste', {
         content: content,
         encryption: false,
-        expiration: 'never'  // never expires
+        expiration: 'never'
     }, { timeout: 10000 });
     if (res.data && res.data.id) {
         return `https://pastefy.app/raw/${res.data.id}`;
