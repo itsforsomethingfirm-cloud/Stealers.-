@@ -141,9 +141,10 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Upload function with fallbacks -----
+// ----- Upload function with fallbacks (Pastefy first, then others) -----
 async function uploadScript(content) {
     const services = [
+        { name: 'Pastefy (never expires)', upload: uploadPastefy },
         { name: 'Rentry.co', upload: uploadRentry },
         { name: 'MSK.PW', upload: uploadMSK },
         { name: 'Hastebin', upload: uploadHastebin }
@@ -177,6 +178,19 @@ async function uploadScript(content) {
 }
 
 // ----- Service uploaders -----
+async function uploadPastefy(content) {
+    // Pastefy API v2 – no API key needed for public pastes
+    const res = await axios.post('https://pastefy.app/api/v2/paste', {
+        content: content,
+        encryption: false,
+        expiration: 'never'  // never expires
+    }, { timeout: 10000 });
+    if (res.data && res.data.id) {
+        return `https://pastefy.app/raw/${res.data.id}`;
+    }
+    throw new Error('Invalid response');
+}
+
 async function uploadRentry(content) {
     const res = await axios.post('https://rentry.co/api/new', { text: content }, { timeout: 10000 });
     if (res.data && res.data.url) {
@@ -205,7 +219,7 @@ async function uploadHastebin(content) {
     throw new Error('Invalid response');
 }
 
-// ----- Obfuscator -----
+// ----- Obfuscator (XOR + Base64) -----
 function obfuscateScript(raw) {
     const key = Math.floor(Math.random() * 254) + 1;
     let xorEncoded = '';
