@@ -1,142 +1,241 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const axios = require('axios');
-const FormData = require('form-data');
+const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, EmbedBuilder } = require('discord.js');
+const express = require('express');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const express = require('express');
-require('dotenv').config();
+const cors = require('cors');
 
-// ----- Web server (health check & self-ping) -----
-const app = express();
-const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Bot is alive!'));
-app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
+// ==========================================
+// CONFIGURATION
+// ==========================================
+const CONFIG = {
+    DISCORD_TOKEN: process.env.DISCORD_TOKEN || "YOUR_DISCORD_BOT_TOKEN_HERE",
+    CLIENT_ID: process.env.CLIENT_ID || "YOUR_CLIENT_ID_HERE",
+    PORT: process.env.PORT || 3000,
+    
+    // Replace with your Discord server's Role IDs
+    ROLES: {
+        OWNER_ROLE_ID: {
+            name: "Owner",
+            allowedDurations: ["1d", "7d", "30d", "lifetime"]
+        },
+        ADMIN_ROLE_ID: {
+            name: "Admin",
+            allowedDurations: ["1d", "7d", "30d"]
+        },
+        RESELLER_ROLE_ID: {
+            name: "Reseller",
+            allowedDurations: ["1d", "7d"]
+        }
+    }
+};
 
-// ----- Self‑ping (keep Render awake) -----
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL;
-if (RENDER_URL) {
-    console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
-    setInterval(() => axios.get(RENDER_URL).catch(() => {}), 4 * 60 * 1000);
-    setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
-} else {
-    console.log('⚠️ Self‑ping disabled – bot may sleep.');
+// ==========================================
+// DATABASE (JSON FILE BASED)
+// ==========================================
+const DB_FILE = path.join(__dirname, 'keys.json');
+
+function loadKeys() {
+    if (!fs.existsSync(DB_FILE)) {
+        fs.writeFileSync(DB_FILE, JSON.stringify({}));
+        return {};
+    }
+    try {
+        return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    } catch {
+        return {};
+    }
 }
 
-// ----- Discord Bot -----
+function saveKeys(data) {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+// Master Key Default Setup
+let keysDb = loadKeys();
+if (!keysDb["owner"]) {
+    keysDb["owner"] = {
+        key: "owner",
+        createdBy: "SYSTEM",
+        duration: "lifetime",
+        expiresAt: null,
+        maxUses: 999999,
+        usedCount: 0,
+        active: true
+    };
+    saveKeys(keysDb);
+}
+
+// ==========================================
+// EXPRESS WEB SERVER (ROBLOX API)
+// ==========================================
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// Roblox Key Verification Endpoint
+app.post('/api/verify', (req, res) => {
+    const { key } = req.body;
+    
+    if (!key) {
+        return res.json({ valid: false, message: "No key provided" });
+    }
+
+    keysDb = loadKeys();
+    const record = keysDb[key];
+
+    if (!record || !record.active) {
+        return res.json({ valid: false, message: "INVALID KEY!" });
+    }
+
+    // Check expiration
+    if (record.expiresAt && new Date() > new Date(record.expiresAt)) {
+        record.active = false;
+        saveKeys(keysDb);
+        return res.json({ valid: false, message: "KEY EXPIRED!" });
+    }
+
+    // Check max uses
+    if (record.usedCount >= record.maxUses) {
+        return res.json({ valid: false, message: "MAX USES REACHED!" });
+    }
+
+    // Increment use count
+    record.usedCount += 1;
+    saveKeys(keysDb);
+
+    return res.json({ valid: true, message: "ACCESS GRANTED" });
+});
+
+app.get('/', (req, res) => {
+    res.send("Milky Hub Key Server Active");
+});
+
+app.listen(CONFIG.PORT, () => {
+    console.log(`[API] Server online on port ${CONFIG.PORT}`);
+});
+
+// ==========================================
+// DISCORD BOT
+// ==========================================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-client.once('ready', () => {
-    console.log(`✅ Logged in as ${client.user.tag}`);
-    const command = new SlashCommandBuilder()
-        .setName('script')
-        .setDescription('Generate a Blox Fruits script with your webhook')
+const commands = [
+    new SlashCommandBuilder()
+        .setName('genkey')
+        .setDescription('Generate a Milky Hub premium key')
         .addStringOption(option =>
-            option.setName('game')
-                .setDescription('Game name (only "bloxfruits" for now)')
+            option.setName('duration')
+                .setDescription('Key valid duration')
                 .setRequired(true)
-                .addChoices({ name: 'Blox Fruits', value: 'bloxfruits' }))
+                .addChoices(
+                    { name: '1 Day', value: '1d' },
+                    { name: '7 Days', value: '7d' },
+                    { name: '30 Days', value: '30d' },
+                    { name: 'Lifetime', value: 'lifetime' }
+                ))
+        .addIntegerOption(option =>
+            option.setName('max_uses')
+                .setDescription('Maximum key uses (default 1)')
+                .setRequired(false)),
+    new SlashCommandBuilder()
+        .setName('revokekey')
+        .setDescription('Revoke an existing key')
         .addStringOption(option =>
-            option.setName('username')
-                .setDescription('Your Discord username (for tracking)')
+            option.setName('key')
+                .setDescription('The key string to disable')
                 .setRequired(true))
-        .addStringOption(option =>
-            option.setName('webhook')
-                .setDescription('Your Discord webhook URL')
-                .setRequired(true));
+];
 
-    client.application.commands.create(command);
-});
+// Register Commands
+const rest = new REST({ version: '10' }).setToken(CONFIG.DISCORD_TOKEN);
+(async () => {
+    try {
+        console.log('[BOT] Registering commands...');
+        await rest.put(
+            Routes.applicationCommands(CONFIG.CLIENT_ID),
+            { body: commands }
+        );
+        console.log('[BOT] Commands registered!');
+    } catch (error) {
+        console.error('[BOT] Command error:', error);
+    }
+})();
 
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'script') return;
 
-    await interaction.deferReply({ ephemeral: true });
+    const { commandName, member } = interaction;
 
-    const game = interaction.options.getString('game');
-    const username = interaction.options.getString('username');
-    const webhook = interaction.options.getString('webhook');
-
-    if (game !== 'bloxfruits') {
-        return interaction.editReply({ content: '❌ Only "bloxfruits" is supported right now.' });
-    }
-    if (!webhook.startsWith('https://discord.com/api/webhooks/')) {
-        return interaction.editReply({ content: '❌ Invalid Discord webhook URL.' });
+    // Check Role Permissions
+    let userPermissions = null;
+    for (const [roleId, perm] of Object.entries(CONFIG.ROLES)) {
+        if (member.roles.cache.has(roleId)) {
+            userPermissions = perm;
+            break;
+        }
     }
 
-    try {
-        // Read template
-        const templatePath = path.join(__dirname, 'template.lua');
-        if (!fs.existsSync(templatePath)) {
-            return interaction.editReply({ content: '❌ Template file `template.lua` not found.' });
-        }
-        let template = fs.readFileSync(templatePath, 'utf8');
-        template = template.replace(/\{\{WEBHOOK\}\}/g, webhook);
-        template = template.replace(/\{\{USERNAME\}\}/g, username);
+    if (!userPermissions) {
+        return interaction.reply({ content: '❌ You do not have permissions to use key management commands.', ephemeral: true });
+    }
 
-        // Obfuscate
-        const obfuscated = obfuscateScript(template);
+    if (commandName === 'genkey') {
+        const duration = interaction.options.getString('duration');
+        const maxUses = interaction.options.getInteger('max_uses') || 1;
 
-        // ----- Upload to 0x0.st (no API key, never expires) -----
-        const form = new FormData();
-        form.append('file', obfuscated, { filename: 'script.lua' });
-
-        const uploadRes = await axios.post('https://0x0.st', form, {
-            headers: form.getHeaders(),
-            timeout: 15000
-        });
-
-        let rawUrl = uploadRes.data.trim();
-        // 0x0.st returns the URL directly, e.g., "https://0x0.st/abc.txt"
-        if (!rawUrl.startsWith('https://0x0.st/')) {
-            throw new Error('Unexpected response from 0x0.st: ' + rawUrl);
+        if (!userPermissions.allowedDurations.includes(duration)) {
+            return interaction.reply({ content: `❌ Your role level (**${userPermissions.name}**) cannot create **${duration}** keys.`, ephemeral: true });
         }
 
-        const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
+        const rawCode = crypto.randomBytes(3).toString('hex').toUpperCase();
+        const generatedKey = `MILKY-${duration.toUpperCase()}-${rawCode}`;
+
+        let expiresAt = null;
+        const now = new Date();
+        if (duration === '1d') expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        if (duration === '7d') expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        if (duration === '30d') expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+        keysDb = loadKeys();
+        keysDb[generatedKey] = {
+            key: generatedKey,
+            createdBy: interaction.user.id,
+            duration: duration,
+            expiresAt: expiresAt ? expiresAt.toISOString() : null,
+            maxUses: maxUses,
+            usedCount: 0,
+            active: true
+        };
+        saveKeys(keysDb);
 
         const embed = new EmbedBuilder()
-            .setColor(0x00FF00)
-            .setTitle('✅ Script Generated')
-            .setDescription(`**Game:** ${game}\n**User:** ${username}`)
+            .setTitle('🌸 Milky Hub Key Generated')
+            .setColor(0xFFB4D2)
             .addFields(
-                { name: '📜 Loadstring', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
-                { name: '📦 Hosted on', value: '0x0.st (never expires)', inline: false },
-                { name: '🔒 Obfuscation', value: 'XOR + Base64', inline: false }
+                { name: 'Key', value: `\`\`\`${generatedKey}\`\`\`` },
+                { name: 'Duration', value: duration, inline: true },
+                { name: 'Max Uses', value: `${maxUses}`, inline: true },
+                { name: 'Created By', value: `<@${interaction.user.id}>`, inline: true }
             )
             .setTimestamp();
 
-        await interaction.editReply({ embeds: [embed] });
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
 
-    } catch (error) {
-        console.error(error);
-        await interaction.editReply({
-            content: '❌ Failed to generate script: ' + error.message
-        });
+    if (commandName === 'revokekey') {
+        const targetKey = interaction.options.getString('key');
+        keysDb = loadKeys();
+
+        if (!keysDb[targetKey]) {
+            return interaction.reply({ content: '❌ Key not found.', ephemeral: true });
+        }
+
+        keysDb[targetKey].active = false;
+        saveKeys(keysDb);
+
+        return interaction.reply({ content: `✅ Key \`${targetKey}\` has been revoked.`, ephemeral: true });
     }
 });
 
-// ----- Obfuscator (XOR + Base64) -----
-function obfuscateScript(raw) {
-    const key = Math.floor(Math.random() * 254) + 1;
-    let xorEncoded = '';
-    for (let i = 0; i < raw.length; i++) {
-        xorEncoded += String.fromCharCode(raw.charCodeAt(i) ^ key);
-    }
-    const base64 = Buffer.from(xorEncoded, 'binary').toString('base64');
-    return `-- Obfuscated with XOR + Base64
-local function decode(str, key)
-    local result = ""
-    for i = 1, #str do
-        result = result .. string.char(string.byte(str, i) ~ key)
-    end
-    return result
-end
-
-local encoded = "${base64}"
-local key = ${key}
-local decoded = decode(encoded, key)
-loadstring(decoded)()
-`;
-}
-
-client.login(process.env.DISCORD_TOKEN);
+client.login(CONFIG.DISCORD_TOKEN);
