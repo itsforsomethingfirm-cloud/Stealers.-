@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
+const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -76,31 +77,21 @@ client.on('interactionCreate', async interaction => {
         // Obfuscate
         const obfuscated = obfuscateScript(template);
 
-        // ----- Upload to Rentry.co with a custom URL slug -----
-        const slug = `exodus_${Date.now()}`; // unique slug
-        const rentryRes = await axios.post(
-            'https://rentry.co/api/new',
-            {
-                text: obfuscated,
-                url: slug  // include this to satisfy "required" field
-            },
-            {
-                timeout: 15000,
-                headers: { 'Content-Type': 'application/json' }
-            }
-        );
+        // ----- Upload to 0x0.st (no API key, never expires) -----
+        const form = new FormData();
+        form.append('file', obfuscated, { filename: 'script.lua' });
 
-        // Check for errors in response
-        if (rentryRes.data && rentryRes.data.status && rentryRes.data.status !== '200') {
-            const errorMsg = rentryRes.data.content || rentryRes.data.errors || 'Unknown error';
-            throw new Error(`Rentry error (${rentryRes.data.status}): ${errorMsg}`);
+        const uploadRes = await axios.post('https://0x0.st', form, {
+            headers: form.getHeaders(),
+            timeout: 15000
+        });
+
+        let rawUrl = uploadRes.data.trim();
+        // 0x0.st returns the URL directly, e.g., "https://0x0.st/abc.txt"
+        if (!rawUrl.startsWith('https://0x0.st/')) {
+            throw new Error('Unexpected response from 0x0.st: ' + rawUrl);
         }
 
-        if (!rentryRes.data || !rentryRes.data.url) {
-            throw new Error('Rentry returned no URL. Response: ' + JSON.stringify(rentryRes.data));
-        }
-
-        const rawUrl = `https://rentry.co/raw/${slug}`; // we can use the slug we set
         const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
 
         const embed = new EmbedBuilder()
@@ -109,7 +100,7 @@ client.on('interactionCreate', async interaction => {
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
                 { name: '📜 Loadstring', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
-                { name: '📦 Hosted on', value: 'Rentry.co (never expires)', inline: false },
+                { name: '📦 Hosted on', value: '0x0.st (never expires)', inline: false },
                 { name: '🔒 Obfuscation', value: 'XOR + Base64', inline: false }
             )
             .setTimestamp();
