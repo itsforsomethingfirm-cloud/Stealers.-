@@ -76,46 +76,17 @@ client.on('interactionCreate', async interaction => {
         // Obfuscate
         const obfuscated = obfuscateScript(template);
 
-        // ----- Upload to Pastefy (with API key) -----
-        const PASTEFY_API_KEY = process.env.PASTEFY_API_KEY;
-        if (!PASTEFY_API_KEY) {
-            return interaction.editReply({ 
-                content: '❌ PASTEFY_API_KEY not set in environment variables. Please add it.' 
-            });
+        // ----- Upload to Rentry.co (no API key needed, never expires) -----
+        const rentryRes = await axios.post('https://rentry.co/api/new', {
+            text: obfuscated
+        }, { timeout: 15000 });
+
+        if (!rentryRes.data || !rentryRes.data.url) {
+            throw new Error('Rentry returned no URL. Response: ' + JSON.stringify(rentryRes.data));
         }
 
-        const pastefyRes = await axios.post(
-            'https://pastefy.app/api/v2/paste',
-            {
-                content: obfuscated,
-                encryption: false,
-                expiration: 'never'
-            },
-            {
-                timeout: 15000,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${PASTEFY_API_KEY}`
-                }
-            }
-        );
-
-        // Handle different possible response formats
-        let id = null;
-        if (pastefyRes.data && pastefyRes.data.id) {
-            id = pastefyRes.data.id;
-        } else if (pastefyRes.data && pastefyRes.data.paste && pastefyRes.data.paste.id) {
-            id = pastefyRes.data.paste.id;
-        } else if (pastefyRes.data && pastefyRes.data.success && pastefyRes.data.paste) {
-            id = pastefyRes.data.paste.id;
-        }
-
-        if (!id) {
-            console.error('Pastefy response:', JSON.stringify(pastefyRes.data, null, 2));
-            throw new Error('Pastefy returned no ID. Response: ' + JSON.stringify(pastefyRes.data));
-        }
-
-        const rawUrl = `https://pastefy.app/raw/${id}`;
+        const slug = rentryRes.data.url.split('/').pop();
+        const rawUrl = `https://rentry.co/raw/${slug}`;
         const loadstringLine = `loadstring(game:HttpGet("${rawUrl}"))()`;
 
         const embed = new EmbedBuilder()
@@ -124,7 +95,7 @@ client.on('interactionCreate', async interaction => {
             .setDescription(`**Game:** ${game}\n**User:** ${username}`)
             .addFields(
                 { name: '📜 Loadstring', value: `\`\`\`lua\n${loadstringLine}\n\`\`\``, inline: false },
-                { name: '📦 Hosted on', value: 'Pastefy (never expires)', inline: false },
+                { name: '📦 Hosted on', value: 'Rentry.co (never expires)', inline: false },
                 { name: '🔒 Obfuscation', value: 'XOR + Base64', inline: false }
             )
             .setTimestamp();
